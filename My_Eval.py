@@ -20,6 +20,7 @@ from qm9.analyze import analyze_stability_for_molecules, analyze_node_distributi
 from qm9.utils import prepare_context, compute_mean_mad
 from qm9 import visualizer as qm9_visualizer
 import qm9.losses as losses
+from reconstruct import reconstruct_from_generated
 
 try:
     from qm9 import rdkit_functions
@@ -98,8 +99,9 @@ def calculate_mmff_energies(molecules, verbose=False):
             xyz_valid = xyz[mask.astype(bool)]
             atom_numbers = [one_hot_to_atomic_number(v) for v in oh_valid]
 
-            mol = make_rdkit_mol(atom_numbers, xyz_valid)
-            mol = Chem.AddHs(mol)
+            # mol = make_rdkit_mol(atom_numbers, xyz_valid)
+            mol = reconstruct_from_generated(xyz, atom_numbers)
+            # mol = Chem.AddHs(mol)
             Chem.SanitizeMol(mol)
 
             props = AllChem.MMFFGetMoleculeProperties(mol, mmffVariant='MMFF94')
@@ -170,36 +172,43 @@ def analyze_and_save(args, eval_args, device, generative_model,
         assert n_samples % batch_size == 0
         molecules = {'one_hot': [], 'x': [], 'node_mask': []}
         start_time = time.time()
-        for i in range(int(n_samples/batch_size)):
-            nodesxsample = nodes_dist.sample(batch_size)
-            one_hot, charges, x, node_mask = sample(
-                args, device, generative_model, dataset_info, prop_dist=prop_dist, nodesxsample=nodesxsample)
-    
-            molecules['one_hot'].append(one_hot.detach().cpu())
-            molecules['x'].append(x.detach().cpu())
-            molecules['node_mask'].append(node_mask.detach().cpu())
-    
-            current_num_samples = (i+1) * batch_size
-            secs_per_sample = (time.time() - start_time) / current_num_samples
-            print('\t %d/%d Molecules generated at %.2f secs/sample' % (
-                current_num_samples, n_samples, secs_per_sample))
-    
-            if save_to_xyz:
-                id_from = i * batch_size
-                qm9_visualizer.save_xyz_file(
-                    join(eval_args.model_path, 'eval/analyzed_molecules/'),
-                    one_hot, charges, x, dataset_info, id_from, name='molecule',
-                    node_mask=node_mask)
-    
+        with torch.no_grad():
+            for i in range(int(n_samples/batch_size)):
+                nodesxsample = nodes_dist.sample(batch_size)
+                one_hot, charges, x, node_mask = sample(
+                    args, device, generative_model, dataset_info, prop_dist=prop_dist, nodesxsample=nodesxsample)
+        
+                molecules['one_hot'].append(one_hot.cpu())
+                molecules['x'].append(x.cpu())
+                molecules['node_mask'].append(node_mask.cpu())
+        
+                current_num_samples = (i+1) * batch_size
+                secs_per_sample = (time.time() - start_time) / current_num_samples
+                print('\t %d/%d Molecules generated at %.2f secs/sample' % (
+                    current_num_samples, n_samples, secs_per_sample))
+        
+                if save_to_xyz:
+                    id_from = i * batch_size
+                    qm9_visualizer.save_xyz_file(
+                        join(eval_args.model_path, 'eval/analyzed_molecules/'),
+                        one_hot, charges, x, dataset_info, id_from, name='molecule',
+                        node_mask=node_mask)
+
         molecules = {key: torch.cat(molecules[key], dim=0) for key in molecules}
 
     energies = calculate_mmff_energies(molecules)
-    for i, e in enumerate(energies):
-        print(f"Molecule {i}: MMFF energy = {e:.2f} kcal/mol" if e is not None else f"Molecule {i}: failed")
+    # Calculate and print the average energy
+    valid_energies = [e for e in energies if e is not None]
+    if valid_energies:
+        average_energy = sum(valid_energies) / len(valid_energies)
+        print(f'Average MMFF Conformer Energy: {average_energy:.2f} kcal/mol')
+    else:
+        print('No valid energies to compute average.')
+
     stability_dict, rdkit_metrics = analyze_stability_for_molecules(
         molecules, dataset_info)
-       #NEW
-        # Typical GeoLDM / QM9 order:  [H, C, N, O, F]
+    
+    # Typical GeoLDM / QM9 order:  [H, C, N, O, F]
     ATOM_TYPES =['H', 'B', 'C', 'N', 'O', 'F', 'Al', 'Si', 'P', 'S', 'Cl', 'As', 'Br', 'I', 'Hg', 'Bi']         # one‑hot column → element
     H_INDEX = ATOM_TYPES.index('H')                 # column that encodes hydrogen
     Avg_size=average_size_without_H(molecules,H_INDEX)
